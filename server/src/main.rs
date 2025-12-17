@@ -1,3 +1,4 @@
+use clap::Parser;
 use sha2::{Digest, Sha256};
 use shared::Message;
 use std::fs::{self, File};
@@ -5,6 +6,13 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::thread;
 use uuid::Uuid; // NEW
+
+#[derive(Parser)]
+struct Cli {
+    /// Port to listen on
+    #[arg(short, long, default_value_t = 7878)]
+    port: u16,
+}
 
 // UPDATED: Merge logic now looks in the temporary sub-folder
 fn merge_chunks(upload_id: &str, file_name: &str, total_chunks: u64) {
@@ -126,8 +134,10 @@ fn handle_client(mut stream: TcpStream) {
 
 // ... (main stays the same) ...
 fn main() {
-    let listener = TcpListener::bind("127.0.0.1:7878").unwrap();
-    println!("Server listening...");
+    let args = Cli::parse();
+    let addr = format!("0.0.0.0:{}", args.port); // 0.0.0.0 allows connections from other PCs
+    let listener = TcpListener::bind(&addr).unwrap();
+    println!("🌍 Server listening on {} ...", addr);
     for stream in listener.incoming() {
         if let Ok(s) = stream {
             thread::spawn(|| handle_client(s));
