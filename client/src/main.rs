@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 use hex;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
 use shared::Message;
 use std::fs::File;
@@ -8,6 +9,7 @@ use std::net::TcpStream;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(name = "ParaFlow Client")]
@@ -136,7 +138,15 @@ fn main() {
             let total_chunks = (file_size + chunk_size - 1) / chunk_size;
             let server_addr = format!("{}:{}", host, port);
 
-            println!("🚀 Connecting to {} (Auth Enabled)...", server_addr);
+            let m = MultiProgress::new();
+
+            let pb_total = m.add(ProgressBar::new(file_size));
+            pb_total.set_style(ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+                .unwrap()
+                .progress_chars("#>-"));
+            pb_total.set_message("Total Progress");
+
+            // println!("🚀 Connecting to {} (Auth Enabled)...", server_addr);
 
             // --- 1. SETUP PHASE ---
             let mut current_upload_id = String::new();
@@ -184,9 +194,18 @@ fn main() {
                 let addr = server_addr.clone();
                 let fname = filename.to_string();
 
+                let pb_worker = m.add(ProgressBar::new_spinner());
+                pb_worker.set_style(
+                    ProgressStyle::with_template("{prefix:.bold.dim} {spinner} {msg}").unwrap(),
+                );
+                pb_worker.set_prefix(format!("Worker {}", worker_id));
+
+                let pb_total_clone = pb_total.clone();
+
                 handles.push(thread::spawn(move || {
                     // <--- CHANGE 2: PASS SECRET HERE
                     let mut stream = connect_and_auth(&addr, &pass);
+                    pb_worker.set_message("Connected");
 
                     loop {
                         let chunk_index = {
@@ -197,10 +216,10 @@ fn main() {
                             }
                         };
 
-                        let mut attempts = 0;
                         loop {
-                            attempts += 1;
+                            pb_worker.set_message(format!("Uploading Chunk #{}", chunk_index));
                             let chunk_data = read_chunk(&fname, chunk_index);
+                            let size_u64 = chunk_data.len() as u64;
                             let mut hasher = Sha256::new();
                             hasher.update(&chunk_data);
                             let hash = hex::encode(hasher.finalize());
@@ -218,24 +237,29 @@ fn main() {
 
                             match read_message(&mut stream) {
                                 Message::ChunkAck { .. } => {
-                                    println!(
-                                        "Worker {} Chunk #{} Success.",
-                                        worker_id, chunk_index
-                                    );
+                                    // println!(
+                                    //     "Worker {} Chunk #{} Success.",
+                                    //     worker_id, chunk_index
+                                    // );
+                                    pb_total_clone.inc(size_u64);
                                     break;
                                 }
                                 Message::ChunkNack { .. } => {
-                                    println!("Worker {} Retry...", worker_id)
+                                    pb_worker
+                                        .set_message(format!("⚠️ Chunk #{} Retry...", chunk_index));
+                                    thread::sleep(Duration::from_millis(500)); // Slow down retry slightly so we can see it
                                 }
                                 _ => {}
                             }
                         }
                     }
+                    pb_worker.finish_with_message("Done");
                 }));
             }
             for h in handles {
                 h.join().unwrap();
             }
+            pb_total.finish_with_message("Upload Complete!");
 
             // --- 3. COMPLETE PHASE ---
             // <--- CHANGE 3: PASS SECRET HERE
