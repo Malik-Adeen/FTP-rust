@@ -1,41 +1,56 @@
-// 'use' imports tools from the Standard Library (std).
-// TcpListener is the tool that listens for connections.
-// Read and Write are "traits" that let us read/write bytes.
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
+use std::thread;
+
+// This function runs inside the new thread.
+// It handles ONE specific client and then exits.
+fn handle_client(mut stream: TcpStream) {
+    let mut buffer = [0; 512];
+
+    // We loop here to keep the conversation going with this specific client
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(size) => {
+                // If size is 0, the client disconnected politely.
+                if size == 0 {
+                    return;
+                }
+
+                let received = String::from_utf8_lossy(&buffer[..size]);
+                println!("Received: {}", received);
+
+                // Send a response back
+                if let Err(e) = stream.write_all(b"Server ACK") {
+                    println!("Failed to send response: {}", e);
+                    return;
+                }
+            }
+            Err(_) => {
+                // Error (like sudden disconnect)
+                println!("Client disconnected with error.");
+                return;
+            }
+        }
+    }
+}
 
 fn main() {
-    // 1. BIND: We ask the OS to give us port 7878.
-    // "127.0.0.1" is "localhost" (your own computer).
-    // .unwrap() means "If this fails (e.g., port in use), crash immediately."
-    // In Rust, we handle errors explicitly. unwrap() is the lazy way to do it.
     let listener = TcpListener::bind("127.0.0.1:7878").unwrap();
+    println!("Multi-threaded Server listening on port 7878...");
 
-    println!("Server is listening on 127.0.0.1:7878...");
-
-    // 2. ACCEPT LOOP: We enter an infinite loop to accept connections.
-    // listener.incoming() gives us a "stream" whenever someone connects.
     for stream in listener.incoming() {
         match stream {
-            Ok(mut stream) => {
-                // We successfully connected!
-                println!("A client connected!");
+            Ok(stream) => {
+                println!("New connection: {}", stream.peer_addr().unwrap());
 
-                // Let's create a buffer (an array of 512 zeros) to hold their message.
-                let mut buffer = [0; 512];
-
-                // Read data from the client into our buffer.
-                stream.read(&mut buffer).unwrap();
-
-                // Convert the raw bytes into a String so we can print it.
-                // String::from_utf8_lossy turns bytes like [72, 101, 108, 108, 111] into "Hello"
-                println!("Client said: {}", String::from_utf8_lossy(&buffer));
-
-                // Send a reply back
-                stream.write_all(b"Hello from Server!").unwrap();
+                // SPAWN THREAD
+                // 'move' forces the thread to take ownership of 'stream'.
+                // This allows the main loop to let go of it and listen for the next person.
+                thread::spawn(move || {
+                    handle_client(stream);
+                });
             }
             Err(e) => {
-                // If the connection failed, print the error.
                 println!("Connection failed: {}", e);
             }
         }

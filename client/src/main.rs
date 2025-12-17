@@ -1,24 +1,24 @@
-use std::io::{Read, Write};
-use std::net::TcpStream; // Note: We use 'TcpStream' here, not 'Listener'
+use shared::Message;
+use std::io::Write;
+use std::net::TcpStream; // <--- Import our new library
 
 fn main() {
-    // 1. CONNECT: Try to dial the server at port 7878.
     match TcpStream::connect("127.0.0.1:7878") {
         Ok(mut stream) => {
-            println!("Successfully connected to server!");
+            println!("Connected!");
 
-            // 2. WRITE: Send a message (as raw bytes)
-            let msg = b"Hello, I am the Client!";
-            stream.write_all(msg).unwrap();
+            // 1. Create a structured message using our Enum
+            let command = Message::Hello {
+                client_id: "ArchLinuxUser".to_string(),
+            };
 
-            // 3. READ: Wait for the server to reply
-            let mut buffer = [0; 512];
-            stream.read(&mut buffer).unwrap();
+            // 2. Convert it to a JSON String
+            let json_data = serde_json::to_string(&command).unwrap();
 
-            println!("Server replied: {}", String::from_utf8_lossy(&buffer));
+            // 3. Send it!
+            stream.write_all(json_data.as_bytes()).unwrap();
+            println!("Sent: {}", json_data);
         }
-        Err(e) => {
-            println!("Failed to connect: {}", e);
-        }
+        Err(e) => println!("Failed: {}", e),
     }
 }

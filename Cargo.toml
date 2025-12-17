@@ -8,6 +8,7 @@ edition = "2024"
 [workspace]
 members = [
     "server",
-    "client"
+    "client",
+    "shared"
 ]
 resolver = "2"
