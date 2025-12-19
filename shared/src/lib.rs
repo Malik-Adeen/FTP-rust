@@ -1,3 +1,4 @@
+pub mod encryption;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug)]

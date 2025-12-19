@@ -6,6 +6,16 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::thread;
 use uuid::Uuid; // NEW
+use shared::encryption;
+
+// Shared encryption key (32 bytes for AES-256)
+// Must match client's key
+const ENCRYPTION_KEY: [u8; 32] = [
+    0x42, 0x8a, 0x7b, 0x1f, 0x9d, 0x3e, 0x5c, 0x6f,
+    0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x07, 0x18,
+    0x29, 0x3a, 0x4b, 0x5c, 0x6d, 0x7e, 0x8f, 0x90,
+    0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x07, 0x18,
+];
 
 #[derive(Parser)]
 struct Cli {
@@ -148,28 +158,38 @@ fn handle_client(mut stream: TcpStream) {
                 );
             }
 
-            // 2. RECEIVE CHUNK: Save to specific folder
+            // 2. RECEIVE CHUNK: Decrypt and save to specific folder
             Ok(Message::ChunkMeta {
                 upload_id,
                 chunk_index,
                 size,
                 hash,
             }) => {
-                let mut file_data = vec![0u8; size];
-                if stream.read_exact(&mut file_data).is_err() {
+                let mut encrypted_data = vec![0u8; size];
+                if stream.read_exact(&mut encrypted_data).is_err() {
                     return;
                 }
 
                 let mut hasher = Sha256::new();
-                hasher.update(&file_data);
+                hasher.update(&encrypted_data);
                 let server_hash = hex::encode(hasher.finalize());
 
                 if server_hash == hash {
-                    // Save to sub-folder
-                    let safe_path = format!("uploads/{}/chunk_{}", upload_id, chunk_index);
-                    let mut f = File::create(&safe_path).unwrap();
-                    f.write_all(&file_data).unwrap();
-                    send_message(&mut stream, &Message::ChunkAck { chunk_index });
+                    // Decrypt the chunk before saving
+                    match encryption::decrypt_chunk(&encrypted_data, &ENCRYPTION_KEY) {
+                        Ok(decrypted_data) => {
+                            // Save DECRYPTED data to sub-folder
+                            let safe_path = format!("uploads/{}/chunk_{}", upload_id, chunk_index);
+                            let mut f = File::create(&safe_path).unwrap();
+                            f.write_all(&decrypted_data).unwrap();
+                            println!("✓ Chunk {} decrypted and saved ({} bytes)", chunk_index, decrypted_data.len());
+                            send_message(&mut stream, &Message::ChunkAck { chunk_index });
+                        }
+                        Err(e) => {
+                            println!("!!! DECRYPTION FAILED on Chunk #{}: {} !!!", chunk_index, e);
+                            send_message(&mut stream, &Message::ChunkNack { chunk_index });
+                        }
+                    }
                 } else {
                     println!("!!! CORRUPTION on Chunk #{} !!!", chunk_index);
                     send_message(&mut stream, &Message::ChunkNack { chunk_index });

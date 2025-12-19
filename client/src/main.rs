@@ -10,6 +10,15 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+use shared::encryption;
+
+// Shared encryption key (must match server's key)
+const ENCRYPTION_KEY: [u8; 32] = [
+    0x42, 0x8a, 0x7b, 0x1f, 0x9d, 0x3e, 0x5c, 0x6f,
+    0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x07, 0x18,
+    0x29, 0x3a, 0x4b, 0x5c, 0x6d, 0x7e, 0x8f, 0x90,
+    0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x07, 0x18,
+];
 
 #[derive(Parser)]
 #[command(name = "ParaFlow Client")]
@@ -220,20 +229,33 @@ fn main() {
                             pb_worker.set_message(format!("Uploading Chunk #{}", chunk_index));
                             let chunk_data = read_chunk(&fname, chunk_index);
                             let size_u64 = chunk_data.len() as u64;
+                            
+                            // Encrypt the chunk
+                            let encrypted_chunk = match encryption::encrypt_chunk(&chunk_data, &ENCRYPTION_KEY) {
+                                Ok(data) => data,
+                                Err(e) => {
+                                    pb_worker.set_message(format!("⚠️ Encryption Error: {}", e));
+                                    thread::sleep(Duration::from_millis(500));
+                                    continue;
+                                }
+                            };
+                            
+                            // Hash the encrypted data (server validates this)
                             let mut hasher = Sha256::new();
-                            hasher.update(&chunk_data);
+                            hasher.update(&encrypted_chunk);
                             let hash = hex::encode(hasher.finalize());
-
+                            
                             send_message(
                                 &mut stream,
                                 &Message::ChunkMeta {
                                     upload_id: id.to_string(),
                                     chunk_index,
-                                    size: chunk_data.len(),
+                                    size: encrypted_chunk.len(),
                                     hash,
                                 },
                             );
-                            stream.write_all(&chunk_data).unwrap();
+
+                            stream.write_all(&encrypted_chunk).unwrap();
 
                             match read_message(&mut stream) {
                                 Message::ChunkAck { .. } => {
