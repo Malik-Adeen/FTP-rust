@@ -3,6 +3,7 @@ mod handler;
 mod storage;
 
 use clap::Parser;
+use dotenvy;
 use std::net::TcpListener;
 use std::thread;
 
@@ -13,6 +14,7 @@ struct Cli {
 }
 
 fn main() {
+    dotenvy::dotenv().ok();
     let args = Cli::parse();
     let addr = format!("0.0.0.0:{}", args.port);
     let listener = TcpListener::bind(&addr).expect("Could not bind to port");

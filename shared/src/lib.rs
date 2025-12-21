@@ -1,9 +1,9 @@
 pub mod encryption;
+use hex;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use thiserror::Error;
-
 /// Unified Error Type for the ParaFlow System
 #[derive(Error, Debug)]
 pub enum ParaFlowError {
@@ -97,4 +97,23 @@ pub fn read_message(stream: &mut TcpStream) -> Result<Message, ParaFlowError> {
     let text = String::from_utf8_lossy(&json_buf);
     let msg = serde_json::from_str(&text)?;
     Ok(msg)
+}
+
+/// Loads the 32-byte encryption key from the PARAFLOW_ENCRYPTION_KEY environment variable
+pub fn load_encryption_key() -> Result<[u8; 32], ParaFlowError> {
+    let key_hex = std::env::var("PARAFLOW_ENCRYPTION_KEY")
+        .map_err(|_| ParaFlowError::SecurityError("PARAFLOW_ENCRYPTION_KEY not set".into()))?;
+
+    let bytes = hex::decode(key_hex)
+        .map_err(|_| ParaFlowError::SecurityError("Invalid hex key format".into()))?;
+
+    if bytes.len() != 32 {
+        return Err(ParaFlowError::SecurityError(
+            "Encryption key must be exactly 32 bytes".into(),
+        ));
+    }
+
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&bytes);
+    Ok(key)
 }
