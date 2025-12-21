@@ -2,8 +2,7 @@ use clap::{Parser, Subcommand};
 use hex;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
-use shared::Message;
-use shared::encryption;
+use shared::{ENCRYPTION_KEY, Message, ParaFlowError, encryption, read_message, send_message}; // Consolidated imports
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::TcpStream;
@@ -11,12 +10,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-
-// Shared encryption key (must match server's key)
-const ENCRYPTION_KEY: [u8; 32] = [
-    0x42, 0x8a, 0x7b, 0x1f, 0x9d, 0x3e, 0x5c, 0x6f, 0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x07, 0x18,
-    0x29, 0x3a, 0x4b, 0x5c, 0x6d, 0x7e, 0x8f, 0x90, 0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x07, 0x18,
-];
 
 #[derive(Parser)]
 #[command(name = "ParaFlow Client")]
@@ -30,17 +23,12 @@ enum Commands {
     Upload {
         #[arg(short, long)]
         file: PathBuf,
-
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
-
         #[arg(short, long, default_value_t = 7878)]
         port: u16,
-
         #[arg(short, long, default_value_t = 4)]
         threads: usize,
-
-        // The secret password flag
         #[arg(long, default_value = "secret123")]
         secret: String,
     },
@@ -53,9 +41,9 @@ const BANNER: &str = r#"
 |___|   |___._|__| |___._||___|   |__||_____|________|
 "#;
 
-// UPDATED: Now accepts 'password' argument
-fn connect_and_auth(address: &str, password: &str) -> TcpStream {
-    let mut stream = TcpStream::connect(address).expect("Failed to connect");
+// UPDATED: Return type is now Result to support the '?' operator
+fn connect_and_auth(address: &str, password: &str) -> Result<TcpStream, ParaFlowError> {
+    let mut stream = TcpStream::connect(address)?;
 
     // 1. Login Request
     send_message(
@@ -63,11 +51,10 @@ fn connect_and_auth(address: &str, password: &str) -> TcpStream {
         &Message::LoginRequest {
             client_id: "admin".to_string(),
         },
-    );
+    )?;
 
-    // 2. Get Challenge
-    let response = read_message(&mut stream);
-    if let Message::LoginChallenge { salt } = response {
+    // 2. Get Challenge (Now returns Result, so we use ?)
+    if let Message::LoginChallenge { salt } = read_message(&mut stream)? {
         // 3. Solve Puzzle
         let combined = format!("{}{}", password, salt);
         let mut hasher = Sha256::new();
@@ -75,19 +62,18 @@ fn connect_and_auth(address: &str, password: &str) -> TcpStream {
         let answer = hex::encode(hasher.finalize());
 
         // 4. Send Answer
-        send_message(&mut stream, &Message::LoginAnswer { hash: answer });
+        send_message(&mut stream, &Message::LoginAnswer { hash: answer })?;
 
         // 5. Check Result
-        match read_message(&mut stream) {
-            Message::Welcome { .. } => return stream, // Success!
-            Message::ErrorMessage { text } => {
-                eprintln!("❌ Login Failed: {}", text);
-                std::process::exit(1); // Exit cleanly
-            }
-            _ => panic!("Protocol Error"),
+        match read_message(&mut stream)? {
+            Message::Welcome { .. } => Ok(stream), // Success!
+            Message::ErrorMessage { text } => Err(ParaFlowError::AuthError(text)),
+            _ => Err(ParaFlowError::ProtocolError(
+                "Unexpected message during auth".into(),
+            )),
         }
     } else {
-        panic!("Protocol Error: Expected Challenge");
+        Err(ParaFlowError::ProtocolError("Expected Challenge".into()))
     }
 }
 
@@ -99,23 +85,6 @@ fn read_chunk(filename: &str, chunk_index: u64) -> Vec<u8> {
     let mut buffer = Vec::new();
     let _ = file.take(chunk_size).read_to_end(&mut buffer);
     buffer
-}
-
-fn send_message(stream: &mut TcpStream, msg: &Message) {
-    let json = serde_json::to_string(msg).unwrap();
-    let len = (json.len() as u32).to_be_bytes();
-    stream.write_all(&len).unwrap();
-    stream.write_all(json.as_bytes()).unwrap();
-}
-
-fn read_message(stream: &mut TcpStream) -> Message {
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).unwrap();
-    let len = u32::from_be_bytes(len_buf) as usize;
-    let mut json_buf = vec![0u8; len];
-    stream.read_exact(&mut json_buf).unwrap();
-    let text = String::from_utf8_lossy(&json_buf);
-    serde_json::from_str(&text).unwrap()
 }
 
 fn main() {
@@ -142,20 +111,22 @@ fn main() {
             let server_addr = format!("{}:{}", host, port);
 
             let m = MultiProgress::new();
-
             let pb_total = m.add(ProgressBar::new(file_size));
             pb_total.set_style(ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({eta})")
-                .unwrap()
-                .progress_chars("#>-"));
+                .unwrap().progress_chars("#>-"));
             pb_total.set_message("Total Progress");
-
-            // println!("🚀 Connecting to {} (Auth Enabled)...", server_addr);
 
             // --- 1. SETUP PHASE ---
             let mut current_upload_id = String::new();
             {
-                // <--- CHANGE 1: PASS SECRET HERE
-                let mut setup_stream = connect_and_auth(&server_addr, secret);
+                // Handle the Result from connect_and_auth
+                let mut setup_stream = match connect_and_auth(&server_addr, secret) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("❌ Connection Failed: {}", e);
+                        std::process::exit(1);
+                    }
+                };
 
                 send_message(
                     &mut setup_stream,
@@ -163,16 +134,17 @@ fn main() {
                         file_name: filename.to_string(),
                         total_size: file_size,
                     },
-                );
+                )
+                .unwrap();
 
-                match read_message(&mut setup_stream) {
+                match read_message(&mut setup_stream).unwrap() {
                     Message::InitAck { upload_id, .. } => {
                         println!("Authorized! Upload ID: {}", upload_id);
                         current_upload_id = upload_id;
                     }
                     Message::ErrorMessage { text } => {
                         eprintln!("❌ Upload Rejected: {}", text);
-                        std::process::exit(1); // Exit cleanly
+                        std::process::exit(1);
                     }
                     _ => panic!("Server sent unexpected message"),
                 }
@@ -180,20 +152,14 @@ fn main() {
 
             // --- 2. WORKER PHASE ---
             let upload_id_arc = Arc::new(current_upload_id.clone());
-
-            // <--- CRITICAL: WRAP SECRET IN ARC FOR THREADS
             let secret_arc = Arc::new(secret.clone());
-
             let job_queue = Arc::new(Mutex::new((0..total_chunks).collect::<Vec<u64>>()));
             let mut handles = vec![];
 
             for worker_id in 0..*threads {
                 let queue = Arc::clone(&job_queue);
                 let id = Arc::clone(&upload_id_arc);
-
-                // <--- CRITICAL: CLONE ARC FOR THIS SPECIFIC THREAD
                 let pass = Arc::clone(&secret_arc);
-
                 let addr = server_addr.clone();
                 let fname = filename.to_string();
 
@@ -202,12 +168,11 @@ fn main() {
                     ProgressStyle::with_template("{prefix:.bold.dim} {spinner} {msg}").unwrap(),
                 );
                 pb_worker.set_prefix(format!("Worker {}", worker_id));
-
                 let pb_total_clone = pb_total.clone();
 
                 handles.push(thread::spawn(move || {
-                    // <--- CHANGE 2: PASS SECRET HERE
-                    let mut stream = connect_and_auth(&addr, &pass);
+                    let mut stream =
+                        connect_and_auth(&addr, &pass).expect("Worker failed to authenticate");
                     pb_worker.set_message("Connected");
 
                     loop {
@@ -224,19 +189,10 @@ fn main() {
                             let chunk_data = read_chunk(&fname, chunk_index);
                             let size_u64 = chunk_data.len() as u64;
 
-                            // Encrypt the chunk
                             let encrypted_chunk =
-                                match encryption::encrypt_chunk(&chunk_data, &ENCRYPTION_KEY) {
-                                    Ok(data) => data,
-                                    Err(e) => {
-                                        pb_worker
-                                            .set_message(format!("⚠️ Encryption Error: {}", e));
-                                        thread::sleep(Duration::from_millis(500));
-                                        continue;
-                                    }
-                                };
+                                encryption::encrypt_chunk(&chunk_data, &ENCRYPTION_KEY)
+                                    .expect("Encryption failed");
 
-                            // Hash the encrypted data (server validates this)
                             let mut hasher = Sha256::new();
                             hasher.update(&encrypted_chunk);
                             let hash = hex::encode(hasher.finalize());
@@ -249,23 +205,20 @@ fn main() {
                                     size: encrypted_chunk.len(),
                                     hash,
                                 },
-                            );
+                            )
+                            .unwrap();
 
                             stream.write_all(&encrypted_chunk).unwrap();
 
-                            match read_message(&mut stream) {
+                            match read_message(&mut stream).unwrap() {
                                 Message::ChunkAck { .. } => {
-                                    // println!(
-                                    //     "Worker {} Chunk #{} Success.",
-                                    //     worker_id, chunk_index
-                                    // );
                                     pb_total_clone.inc(size_u64);
                                     break;
                                 }
                                 Message::ChunkNack { .. } => {
                                     pb_worker
                                         .set_message(format!("⚠️ Chunk #{} Retry...", chunk_index));
-                                    thread::sleep(Duration::from_millis(500)); // Slow down retry slightly so we can see it
+                                    thread::sleep(Duration::from_millis(500));
                                 }
                                 _ => {}
                             }
@@ -280,17 +233,17 @@ fn main() {
             pb_total.finish_with_message("Upload Complete!");
 
             // --- 3. COMPLETE PHASE ---
-            // <--- CHANGE 3: PASS SECRET HERE
-            let mut stream = connect_and_auth(&server_addr, secret);
-
+            let mut stream =
+                connect_and_auth(&server_addr, secret).expect("Final completion failed");
             send_message(
                 &mut stream,
                 &Message::Complete {
                     upload_id: current_upload_id,
                     file_name: filename.to_string(),
-                    total_chunks: total_chunks, // <--- SEND IT HERE
+                    total_chunks,
                 },
-            );
+            )
+            .unwrap();
             println!("Done.");
         }
     }
