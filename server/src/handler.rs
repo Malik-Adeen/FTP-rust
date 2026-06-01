@@ -1,15 +1,143 @@
 use crate::{auth, storage};
 use sha2::{Digest, Sha256};
-use shared::{ENCRYPTION_KEY, Message, ParaFlowError, encryption, read_message, send_message};
+use shared::{Message, ParaFlowError, encryption, load_encryption_key, read_message, send_message};
 use std::io::Read;
 use std::net::TcpStream;
+use uuid::Uuid;
+
+struct SessionState {
+    current_salt: Option<String>,
+    is_authenticated: bool,
+    session_id: Option<String>,
+    encryption_key: [u8; 32],
+}
+
+impl SessionState {
+    fn new(encryption_key: [u8; 32]) -> Self {
+        Self {
+            current_salt: None,
+            is_authenticated: false,
+            session_id: None,
+            encryption_key,
+        }
+    }
+}
+
+fn require_session_id(state: &SessionState) -> Result<String, ParaFlowError> {
+    state
+        .session_id
+        .clone()
+        .ok_or_else(|| ParaFlowError::SecurityError("Unauthorized Access".into()))
+}
+
+fn handle_login_request(
+    state: &mut SessionState,
+    stream: &mut TcpStream,
+    client_id: String,
+) -> Result<(), ParaFlowError> {
+    println!("Login attempt: {}", client_id);
+    let salt = auth::generate_salt();
+    state.current_salt = Some(salt.clone());
+    send_message(stream, &Message::LoginChallenge { salt })
+}
+
+fn handle_login_answer(
+    state: &mut SessionState,
+    stream: &mut TcpStream,
+    hash: String,
+) -> Result<(), ParaFlowError> {
+    let salt = state
+        .current_salt
+        .take()
+        .ok_or_else(|| ParaFlowError::ProtocolError("Missing login challenge".into()))?;
+
+    if auth::verify_user("admin", &salt, &hash) {
+        println!("Auth Success!");
+        state.is_authenticated = true;
+        let session_id = Uuid::new_v4().to_string();
+        state.session_id = Some(session_id.clone());
+        send_message(stream, &Message::Welcome { session_id })
+    } else {
+        send_message(
+            stream,
+            &Message::ErrorMessage {
+                text: "Access Denied".into(),
+            },
+        )?;
+        Err(ParaFlowError::AuthError("Wrong Password".into()))
+    }
+}
+
+fn handle_init_upload(
+    session_id: &str,
+    stream: &mut TcpStream,
+    file_name: String,
+) -> Result<(), ParaFlowError> {
+    if file_name.ends_with(".sh") || file_name.ends_with(".exe") {
+        send_message(
+            stream,
+            &Message::ErrorMessage {
+                text: "Forbidden file type".into(),
+            },
+        )?;
+        return Ok(());
+    }
+
+    let upload_id = Uuid::new_v4().to_string();
+    storage::create_upload_dir(session_id, &upload_id)?;
+    send_message(
+        stream,
+        &Message::InitAck {
+            chunk_size: 0,
+            upload_id,
+        },
+    )
+}
+
+fn handle_chunk_meta(
+    session_id: &str,
+    encryption_key: &[u8; 32],
+    stream: &mut TcpStream,
+    upload_id: String,
+    chunk_index: u64,
+    size: usize,
+    hash: String,
+) -> Result<(), ParaFlowError> {
+    let mut encrypted_data = vec![0u8; size];
+    stream.read_exact(&mut encrypted_data)?;
+
+    let mut hasher = Sha256::new();
+    hasher.update(&encrypted_data);
+    let server_hash = hex::encode(hasher.finalize());
+
+    if server_hash == hash {
+        match encryption::decrypt_chunk(&encrypted_data, encryption_key) {
+            Ok(decrypted_data) => {
+                storage::save_chunk(session_id, &upload_id, chunk_index, &decrypted_data)?;
+                send_message(stream, &Message::ChunkAck { chunk_index })
+            }
+            Err(_) => send_message(stream, &Message::ChunkNack { chunk_index }),
+        }
+    } else {
+        send_message(stream, &Message::ChunkNack { chunk_index })
+    }
+}
+
+fn handle_complete(
+    session_id: &str,
+    upload_id: String,
+    file_name: String,
+    total_chunks: u64,
+) -> Result<(), ParaFlowError> {
+    storage::merge_chunks(session_id, &upload_id, &file_name, total_chunks)?;
+    Ok(())
+}
 
 pub fn handle_client(mut stream: TcpStream) -> Result<(), ParaFlowError> {
-    let mut current_salt = String::new();
-    let mut is_authenticated = false;
+    let encryption_key = load_encryption_key()?;
+    let mut state = SessionState::new(encryption_key);
 
     loop {
-        // Read the next message; exit the loop if the connection closes
         let request = match read_message(&mut stream) {
             Ok(msg) => msg,
             Err(_) => return Ok(()),
@@ -17,54 +145,17 @@ pub fn handle_client(mut stream: TcpStream) -> Result<(), ParaFlowError> {
 
         match request {
             Message::LoginRequest { client_id } => {
-                println!("Login attempt: {}", client_id);
-                let salt = auth::generate_salt();
-                current_salt = salt.clone();
-                send_message(&mut stream, &Message::LoginChallenge { salt })?;
+                handle_login_request(&mut state, &mut stream, client_id)?;
             }
             Message::LoginAnswer { hash } => {
-                if auth::verify_user("admin", &current_salt, &hash) {
-                    println!("Auth Success!");
-                    is_authenticated = true;
-                    send_message(
-                        &mut stream,
-                        &Message::Welcome {
-                            session_id: "s1".to_string(),
-                        },
-                    )?;
-                } else {
-                    send_message(
-                        &mut stream,
-                        &Message::ErrorMessage {
-                            text: "Access Denied".into(),
-                        },
-                    )?;
-                    return Err(ParaFlowError::AuthError("Wrong Password".into()));
-                }
+                handle_login_answer(&mut state, &mut stream, hash)?;
             }
-            _ if !is_authenticated => {
+            _ if !state.is_authenticated => {
                 return Err(ParaFlowError::SecurityError("Unauthorized Access".into()));
             }
-
             Message::InitUpload { file_name, .. } => {
-                if file_name.ends_with(".sh") || file_name.ends_with(".exe") {
-                    send_message(
-                        &mut stream,
-                        &Message::ErrorMessage {
-                            text: "Forbidden file type".into(),
-                        },
-                    )?;
-                    continue;
-                }
-                let uuid = uuid::Uuid::new_v4().to_string();
-                storage::create_upload_dir(&uuid)?;
-                send_message(
-                    &mut stream,
-                    &Message::InitAck {
-                        chunk_size: 0,
-                        upload_id: uuid,
-                    },
-                )?;
+                let session_id = require_session_id(&state)?;
+                handle_init_upload(&session_id, &mut stream, file_name)?;
             }
             Message::ChunkMeta {
                 upload_id,
@@ -72,31 +163,24 @@ pub fn handle_client(mut stream: TcpStream) -> Result<(), ParaFlowError> {
                 size,
                 hash,
             } => {
-                let mut encrypted_data = vec![0u8; size];
-                stream.read_exact(&mut encrypted_data)?;
-
-                let mut hasher = Sha256::new();
-                hasher.update(&encrypted_data);
-                let server_hash = hex::encode(hasher.finalize());
-
-                if server_hash == hash {
-                    match encryption::decrypt_chunk(&encrypted_data, &ENCRYPTION_KEY) {
-                        Ok(decrypted_data) => {
-                            storage::save_chunk(&upload_id, chunk_index, &decrypted_data)?;
-                            send_message(&mut stream, &Message::ChunkAck { chunk_index })?;
-                        }
-                        Err(_) => send_message(&mut stream, &Message::ChunkNack { chunk_index })?,
-                    }
-                } else {
-                    send_message(&mut stream, &Message::ChunkNack { chunk_index })?;
-                }
+                let session_id = require_session_id(&state)?;
+                handle_chunk_meta(
+                    &session_id,
+                    &state.encryption_key,
+                    &mut stream,
+                    upload_id,
+                    chunk_index,
+                    size,
+                    hash,
+                )?;
             }
             Message::Complete {
                 upload_id,
                 file_name,
                 total_chunks,
             } => {
-                storage::merge_chunks(&upload_id, &file_name, total_chunks)?;
+                let session_id = require_session_id(&state)?;
+                handle_complete(&session_id, upload_id, file_name, total_chunks)?;
             }
             _ => {}
         }
