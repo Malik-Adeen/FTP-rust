@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use hex;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
-use shared::{ENCRYPTION_KEY, Message, ParaFlowError, encryption, read_message, send_message}; // Consolidated imports
+use shared::{Message, ParaFlowError, encryption, load_encryption_key, read_message, send_message};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::TcpStream;
@@ -99,6 +99,14 @@ fn main() {
             threads,
             secret,
         } => {
+            let encryption_key = match load_encryption_key() {
+                Ok(key) => key,
+                Err(err) => {
+                    eprintln!("Missing encryption key: {}", err);
+                    std::process::exit(1);
+                }
+            };
+
             let filename = file.to_str().expect("Invalid filename");
             if !file.exists() {
                 eprintln!("Error: File not found");
@@ -162,6 +170,7 @@ fn main() {
                 let pass = Arc::clone(&secret_arc);
                 let addr = server_addr.clone();
                 let fname = filename.to_string();
+                let key = encryption_key;
 
                 let pb_worker = m.add(ProgressBar::new_spinner());
                 pb_worker.set_style(
@@ -190,7 +199,7 @@ fn main() {
                             let size_u64 = chunk_data.len() as u64;
 
                             let encrypted_chunk =
-                                encryption::encrypt_chunk(&chunk_data, &ENCRYPTION_KEY)
+                                encryption::encrypt_chunk(&chunk_data, &key)
                                     .expect("Encryption failed");
 
                             let mut hasher = Sha256::new();
