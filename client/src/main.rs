@@ -41,6 +41,8 @@ enum Commands {
 }
 
 #[derive(Debug)]
+// SAFETY: Disables certificate identity verification. Connection is still TLS-encrypted.
+// For production use, replace with cert pinning against the server's self-signed cert.
 struct NoVerify;
 
 impl ServerCertVerifier for NoVerify {
@@ -188,7 +190,7 @@ fn main() {
                 .unwrap().progress_chars("#>-"));
             pb_total.set_message("Total Progress");
 
-            let mut current_upload_id = String::new();
+            let current_upload_id;
             {
                 let mut setup_stream = match connect_and_auth(&server_addr, secret) {
                     Ok(s) => s,
