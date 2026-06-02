@@ -13,3 +13,5 @@ sha2 = "0.10.9"
 shared = { version = "0.1.0", path = "../shared" }
 uuid = { version = "1.19.0", features = ["v4", "fast-rng"] }
 governor = "0.6"
+rcgen = "0.13"
+rustls = { version = "0.23", features = ["ring"] }

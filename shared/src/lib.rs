@@ -2,7 +2,6 @@ pub mod encryption;
 use hex;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
-use std::net::TcpStream;
 use thiserror::Error;
 pub const MAX_CHUNK_BYTES: usize = 8 * 1024 * 1024 + 256;
 
@@ -73,8 +72,7 @@ pub enum Message {
     },
 }
 
-/// Centralized helper to send messages over a TCP stream
-pub fn send_message(stream: &mut TcpStream, msg: &Message) -> Result<(), ParaFlowError> {
+pub fn send_message<W: Write>(stream: &mut W, msg: &Message) -> Result<(), ParaFlowError> {
     let json = serde_json::to_string(msg)?;
     let len = (json.len() as u32).to_be_bytes();
     stream.write_all(&len)?;
@@ -82,8 +80,7 @@ pub fn send_message(stream: &mut TcpStream, msg: &Message) -> Result<(), ParaFlo
     Ok(())
 }
 
-/// Centralized helper to read messages from a TCP stream
-pub fn read_message(stream: &mut TcpStream) -> Result<Message, ParaFlowError> {
+pub fn read_message<R: Read>(stream: &mut R) -> Result<Message, ParaFlowError> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf)?;
     let len = u32::from_be_bytes(len_buf) as usize;

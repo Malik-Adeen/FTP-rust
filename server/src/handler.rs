@@ -2,8 +2,8 @@ use crate::{auth, rate_limit::AuthRateLimiter, storage};
 use sha2::{Digest, Sha256};
 use shared::{MAX_CHUNK_BYTES, Message, ParaFlowError, encryption, load_encryption_key, read_message, send_message};
 use std::collections::HashMap;
-use std::io::Read;
-use std::net::{SocketAddr, TcpStream};
+use std::io::{Read, Write};
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
@@ -42,9 +42,9 @@ fn sanitize_file_name(name: &str) -> Option<String> {
         .map(|n| n.to_string())
 }
 
-fn handle_login_request(
+fn handle_login_request<S: Read + Write>(
     state: &mut SessionState,
-    stream: &mut TcpStream,
+    stream: &mut S,
     client_id: String,
     peer_addr: SocketAddr,
     rate_limiter: &Arc<AuthRateLimiter>,
@@ -64,9 +64,9 @@ fn handle_login_request(
     send_message(stream, &Message::LoginChallenge { salt })
 }
 
-fn handle_login_answer(
+fn handle_login_answer<S: Read + Write>(
     state: &mut SessionState,
-    stream: &mut TcpStream,
+    stream: &mut S,
     hash: String,
 ) -> Result<(), ParaFlowError> {
     let salt = state
@@ -91,9 +91,9 @@ fn handle_login_answer(
     }
 }
 
-fn handle_init_upload(
+fn handle_init_upload<S: Read + Write>(
     session_id: &str,
-    stream: &mut TcpStream,
+    stream: &mut S,
     file_name: String,
     registry: &Arc<UploadRegistry>,
 ) -> Result<(), ParaFlowError> {
@@ -111,22 +111,13 @@ fn handle_init_upload(
 
     let upload_id = Uuid::new_v4().to_string();
     storage::create_upload_dir(session_id, &upload_id)?;
-    registry
-        .lock()
-        .unwrap()
-        .insert(upload_id.clone(), session_id.to_string());
-    send_message(
-        stream,
-        &Message::InitAck {
-            chunk_size: 0,
-            upload_id,
-        },
-    )
+    registry.lock().unwrap().insert(upload_id.clone(), session_id.to_string());
+    send_message(stream, &Message::InitAck { chunk_size: 0, upload_id })
 }
 
-fn handle_chunk_meta(
+fn handle_chunk_meta<S: Read + Write>(
     encryption_key: &[u8; 32],
-    stream: &mut TcpStream,
+    stream: &mut S,
     upload_id: String,
     chunk_index: u64,
     size: usize,
@@ -167,8 +158,8 @@ fn handle_chunk_meta(
     }
 }
 
-fn handle_complete(
-    stream: &mut TcpStream,
+fn handle_complete<S: Read + Write>(
+    stream: &mut S,
     upload_id: String,
     file_name: String,
     total_chunks: u64,
@@ -187,8 +178,8 @@ fn handle_complete(
     send_message(stream, &Message::CompleteAck)
 }
 
-pub fn handle_client(
-    mut stream: TcpStream,
+pub fn handle_client<S: Read + Write>(
+    mut stream: S,
     peer_addr: SocketAddr,
     registry: Arc<UploadRegistry>,
     rate_limiter: Arc<AuthRateLimiter>,

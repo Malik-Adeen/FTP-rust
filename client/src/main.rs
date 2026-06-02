@@ -2,11 +2,16 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use clap::{Parser, Subcommand};
 use hex;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use rustls::ClientConfig;
+use rustls::ClientConnection;
+use rustls::StreamOwned;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, Error as TlsError, SignatureScheme};
 use sha2::{Digest, Sha256};
 use shared::{Message, ParaFlowError, encryption, load_encryption_key, read_message, send_message};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::net::TcpStream;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -35,18 +40,77 @@ enum Commands {
     },
 }
 
+#[derive(Debug)]
+struct NoVerify;
+
+impl ServerCertVerifier for NoVerify {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer,
+        _intermediates: &[CertificateDer],
+        _server_name: &ServerName,
+        _ocsp: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, TlsError> {
+        Ok(ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self,
+        _msg: &[u8],
+        _cert: &CertificateDer,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+    fn verify_tls13_signature(
+        &self,
+        _msg: &[u8],
+        _cert: &CertificateDer,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
 const BANNER: &str = r#"
- ______                    _______ __                 
+ ______                    _______ __
 |   __ \.---.-.----.---.-.|    ___|  |.-----.--.--.--.
 |    __/|  _  |   _|  _  ||    ___|  ||  _  |  |  |  |
 |___|   |___._|__| |___._||___|   |__||_____|________|
 "#;
 
-// UPDATED: Return type is now Result to support the '?' operator
-fn connect_and_auth(address: &str, password: &str) -> Result<TcpStream, ParaFlowError> {
-    let mut stream = TcpStream::connect(address)?;
+fn connect_and_auth(
+    address: &str,
+    password: &str,
+) -> Result<StreamOwned<ClientConnection, std::net::TcpStream>, ParaFlowError> {
+    let tcp = std::net::TcpStream::connect(address)?;
+    let host = address.split(':').next().unwrap_or("localhost").to_string();
 
-    // 1. Login Request
+    let client_config = Arc::new(
+        ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerify))
+            .with_no_client_auth(),
+    );
+
+    let server_name: ServerName<'static> = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        ServerName::IpAddress(ip.into())
+    } else {
+        ServerName::try_from(host.clone())
+            .map_err(|_| ParaFlowError::ProtocolError("Invalid server name".into()))?
+            .to_owned()
+    };
+
+    let conn = ClientConnection::new(client_config, server_name)
+        .map_err(|e| ParaFlowError::ProtocolError(e.to_string()))?;
+
+    let mut stream = StreamOwned::new(conn, tcp);
+
     send_message(
         &mut stream,
         &Message::LoginRequest {
@@ -54,9 +118,7 @@ fn connect_and_auth(address: &str, password: &str) -> Result<TcpStream, ParaFlow
         },
     )?;
 
-    // 2. Get Challenge (Now returns Result, so we use ?)
     if let Message::LoginChallenge { salt } = read_message(&mut stream)? {
-        // 3. Solve Puzzle
         let params = Params::new(19456, 2, 1, Some(32)).expect("valid argon2 params");
         let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
         let mut output = [0u8; 32];
@@ -65,12 +127,10 @@ fn connect_and_auth(address: &str, password: &str) -> Result<TcpStream, ParaFlow
             .expect("Argon2 failed");
         let answer = hex::encode(output);
 
-        // 4. Send Answer
         send_message(&mut stream, &Message::LoginAnswer { hash: answer })?;
 
-        // 5. Check Result
         match read_message(&mut stream)? {
-            Message::Welcome { .. } => Ok(stream), // Success!
+            Message::Welcome { .. } => Ok(stream),
             Message::ErrorMessage { text } => Err(ParaFlowError::AuthError(text)),
             _ => Err(ParaFlowError::ProtocolError(
                 "Unexpected message during auth".into(),
@@ -128,14 +188,12 @@ fn main() {
                 .unwrap().progress_chars("#>-"));
             pb_total.set_message("Total Progress");
 
-            // --- 1. SETUP PHASE ---
             let mut current_upload_id = String::new();
             {
-                // Handle the Result from connect_and_auth
                 let mut setup_stream = match connect_and_auth(&server_addr, secret) {
                     Ok(s) => s,
                     Err(e) => {
-                        eprintln!("❌ Connection Failed: {}", e);
+                        eprintln!("Connection Failed: {}", e);
                         std::process::exit(1);
                     }
                 };
@@ -155,14 +213,13 @@ fn main() {
                         current_upload_id = upload_id;
                     }
                     Message::ErrorMessage { text } => {
-                        eprintln!("❌ Upload Rejected: {}", text);
+                        eprintln!("Upload Rejected: {}", text);
                         std::process::exit(1);
                     }
                     _ => panic!("Server sent unexpected message"),
                 }
             }
 
-            // --- 2. WORKER PHASE ---
             let upload_id_arc = Arc::new(current_upload_id.clone());
             let secret_arc = Arc::new(secret.clone());
             let job_queue = Arc::new(Mutex::new((0..total_chunks).collect::<Vec<u64>>()));
@@ -230,7 +287,7 @@ fn main() {
                                 }
                                 Message::ChunkNack { .. } => {
                                     pb_worker
-                                        .set_message(format!("⚠️ Chunk #{} Retry...", chunk_index));
+                                        .set_message(format!("Chunk #{} Retry...", chunk_index));
                                     thread::sleep(Duration::from_millis(500));
                                 }
                                 _ => {}
@@ -245,7 +302,6 @@ fn main() {
             }
             pb_total.finish_with_message("Upload Complete!");
 
-            // --- 3. COMPLETE PHASE ---
             let mut stream =
                 connect_and_auth(&server_addr, secret).expect("Final completion failed");
             send_message(
