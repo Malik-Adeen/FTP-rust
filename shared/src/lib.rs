@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use thiserror::Error;
+pub const MAX_CHUNK_BYTES: usize = 8 * 1024 * 1024 + 256;
+
 /// Unified Error Type for the ParaFlow System
 #[derive(Error, Debug)]
 pub enum ParaFlowError {
@@ -71,6 +73,7 @@ pub enum Message {
         file_name: String,
         total_chunks: u64,
     },
+    CompleteAck,
     ErrorMessage {
         text: String,
     },

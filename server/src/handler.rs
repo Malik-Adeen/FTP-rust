@@ -1,6 +1,6 @@
 use crate::{auth, storage};
 use sha2::{Digest, Sha256};
-use shared::{Message, ParaFlowError, encryption, load_encryption_key, read_message, send_message};
+use shared::{MAX_CHUNK_BYTES, Message, ParaFlowError, encryption, load_encryption_key, read_message, send_message};
 use std::collections::HashMap;
 use std::io::Read;
 use std::net::TcpStream;
@@ -122,6 +122,13 @@ fn handle_chunk_meta(
     hash: String,
     registry: &Arc<UploadRegistry>,
 ) -> Result<(), ParaFlowError> {
+    if size > MAX_CHUNK_BYTES {
+        return Err(ParaFlowError::ProtocolError(format!(
+            "Chunk size {} exceeds maximum {}",
+            size, MAX_CHUNK_BYTES
+        )));
+    }
+
     let session_id = registry
         .lock()
         .unwrap()
@@ -150,7 +157,7 @@ fn handle_chunk_meta(
 }
 
 fn handle_complete(
-    _stream: &mut TcpStream,
+    stream: &mut TcpStream,
     upload_id: String,
     file_name: String,
     total_chunks: u64,
@@ -166,7 +173,7 @@ fn handle_complete(
         .ok_or_else(|| ParaFlowError::SecurityError("Unknown upload id".into()))?;
 
     storage::merge_chunks(&session_id, &upload_id, &safe_name, total_chunks)?;
-    Ok(())
+    send_message(stream, &Message::CompleteAck)
 }
 
 pub fn handle_client(

@@ -253,7 +253,14 @@ fn main() {
                 },
             )
             .unwrap();
-            println!("Done.");
+            match read_message(&mut stream).unwrap() {
+                Message::CompleteAck => println!("Upload complete. File reassembled on server."),
+                Message::ErrorMessage { text } => {
+                    eprintln!("Server error during merge: {}", text);
+                    std::process::exit(1);
+                }
+                _ => eprintln!("Unexpected server response after Complete."),
+            }
         }
     }
 }
