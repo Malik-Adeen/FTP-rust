@@ -34,6 +34,14 @@ fn require_session_id(state: &SessionState) -> Result<String, ParaFlowError> {
         .ok_or_else(|| ParaFlowError::SecurityError("Unauthorized Access".into()))
 }
 
+fn sanitize_file_name(name: &str) -> Option<String> {
+    std::path::Path::new(name)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty())
+        .map(|n| n.to_string())
+}
+
 fn handle_login_request(
     state: &mut SessionState,
     stream: &mut TcpStream,
@@ -78,13 +86,15 @@ fn handle_init_upload(
     file_name: String,
     registry: &Arc<UploadRegistry>,
 ) -> Result<(), ParaFlowError> {
-    if file_name.ends_with(".sh") || file_name.ends_with(".exe") {
-        send_message(
-            stream,
-            &Message::ErrorMessage {
-                text: "Forbidden file type".into(),
-            },
-        )?;
+    let safe_name = match sanitize_file_name(&file_name) {
+        Some(n) => n,
+        None => {
+            send_message(stream, &Message::ErrorMessage { text: "Invalid file name".into() })?;
+            return Ok(());
+        }
+    };
+    if safe_name.ends_with(".sh") || safe_name.ends_with(".exe") {
+        send_message(stream, &Message::ErrorMessage { text: "Forbidden file type".into() })?;
         return Ok(());
     }
 
@@ -146,13 +156,16 @@ fn handle_complete(
     total_chunks: u64,
     registry: &Arc<UploadRegistry>,
 ) -> Result<(), ParaFlowError> {
+    let safe_name = sanitize_file_name(&file_name)
+        .ok_or_else(|| ParaFlowError::ProtocolError("Invalid file name".into()))?;
+
     let session_id = registry
         .lock()
         .unwrap()
         .remove(&upload_id)
         .ok_or_else(|| ParaFlowError::SecurityError("Unknown upload id".into()))?;
 
-    storage::merge_chunks(&session_id, &upload_id, &file_name, total_chunks)?;
+    storage::merge_chunks(&session_id, &upload_id, &safe_name, total_chunks)?;
     Ok(())
 }
 
