@@ -1,9 +1,9 @@
-use crate::{auth, storage};
+use crate::{auth, rate_limit::AuthRateLimiter, storage};
 use sha2::{Digest, Sha256};
 use shared::{MAX_CHUNK_BYTES, Message, ParaFlowError, encryption, load_encryption_key, read_message, send_message};
 use std::collections::HashMap;
 use std::io::Read;
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
@@ -46,7 +46,18 @@ fn handle_login_request(
     state: &mut SessionState,
     stream: &mut TcpStream,
     client_id: String,
+    peer_addr: SocketAddr,
+    rate_limiter: &Arc<AuthRateLimiter>,
 ) -> Result<(), ParaFlowError> {
+    if rate_limiter.check_key(&peer_addr.ip()).is_err() {
+        send_message(
+            stream,
+            &Message::ErrorMessage {
+                text: "Too many login attempts. Try again later.".into(),
+            },
+        )?;
+        return Err(ParaFlowError::SecurityError("Rate limit exceeded".into()));
+    }
     println!("Login attempt: {}", client_id);
     let salt = auth::generate_salt();
     state.current_salt = Some(salt.clone());
@@ -178,7 +189,9 @@ fn handle_complete(
 
 pub fn handle_client(
     mut stream: TcpStream,
+    peer_addr: SocketAddr,
     registry: Arc<UploadRegistry>,
+    rate_limiter: Arc<AuthRateLimiter>,
 ) -> Result<(), ParaFlowError> {
     let encryption_key = load_encryption_key()?;
     let mut state = SessionState::new(encryption_key);
@@ -191,7 +204,7 @@ pub fn handle_client(
 
         match request {
             Message::LoginRequest { client_id } => {
-                handle_login_request(&mut state, &mut stream, client_id)?;
+                handle_login_request(&mut state, &mut stream, client_id, peer_addr, &rate_limiter)?;
             }
             Message::LoginAnswer { hash } => {
                 handle_login_answer(&mut state, &mut stream, hash)?;
