@@ -1,17 +1,11 @@
-use argon2::{Algorithm, Argon2, Params, Version};
+pub mod transfer;
+pub mod tui;
+
 use clap::{Parser, Subcommand};
-use hex;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use rustls::ClientConfig;
-use rustls::ClientConnection;
-use rustls::StreamOwned;
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{DigitallySignedStruct, Error as TlsError, SignatureScheme};
 use sha2::{Digest, Sha256};
-use shared::{Message, ParaFlowError, encryption, load_encryption_key, read_message, send_message};
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use shared::{Message, encryption, load_encryption_key, read_message, send_message};
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -21,7 +15,7 @@ use std::time::Duration;
 #[command(name = "ParaFlow Client")]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -40,45 +34,6 @@ enum Commands {
     },
 }
 
-#[derive(Debug)]
-// SAFETY: Disables certificate identity verification. Connection is still TLS-encrypted.
-// For production use, replace with cert pinning against the server's self-signed cert.
-struct NoVerify;
-
-impl ServerCertVerifier for NoVerify {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer,
-        _intermediates: &[CertificateDer],
-        _server_name: &ServerName,
-        _ocsp: &[u8],
-        _now: UnixTime,
-    ) -> Result<ServerCertVerified, TlsError> {
-        Ok(ServerCertVerified::assertion())
-    }
-    fn verify_tls12_signature(
-        &self,
-        _msg: &[u8],
-        _cert: &CertificateDer,
-        _dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, TlsError> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-    fn verify_tls13_signature(
-        &self,
-        _msg: &[u8],
-        _cert: &CertificateDer,
-        _dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, TlsError> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        rustls::crypto::ring::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
-}
-
 const BANNER: &str = r#"
  ______                    _______ __
 |   __ \.---.-.----.---.-.|    ___|  |.-----.--.--.--.
@@ -86,85 +41,39 @@ const BANNER: &str = r#"
 |___|   |___._|__| |___._||___|   |__||_____|________|
 "#;
 
-fn connect_and_auth(
-    address: &str,
-    password: &str,
-) -> Result<StreamOwned<ClientConnection, std::net::TcpStream>, ParaFlowError> {
-    let tcp = std::net::TcpStream::connect(address)?;
-    let host = address.split(':').next().unwrap_or("localhost").to_string();
-
-    let client_config = Arc::new(
-        ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoVerify))
-            .with_no_client_auth(),
-    );
-
-    let server_name: ServerName<'static> = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        ServerName::IpAddress(ip.into())
-    } else {
-        ServerName::try_from(host.clone())
-            .map_err(|_| ParaFlowError::ProtocolError("Invalid server name".into()))?
-            .to_owned()
+fn load_config() -> (transfer::Config, Option<String>) {
+    let home = match dirs::home_dir() {
+        Some(path) => path,
+        None => return (transfer::Config::default(), Some("no home dir found, using defaults".to_string())),
     };
-
-    let conn = ClientConnection::new(client_config, server_name)
-        .map_err(|e| ParaFlowError::ProtocolError(e.to_string()))?;
-
-    let mut stream = StreamOwned::new(conn, tcp);
-
-    send_message(
-        &mut stream,
-        &Message::LoginRequest {
-            client_id: "admin".to_string(),
-        },
-    )?;
-
-    if let Message::LoginChallenge { salt } = read_message(&mut stream)? {
-        let params = Params::new(19456, 2, 1, Some(32)).expect("valid argon2 params");
-        let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-        let mut output = [0u8; 32];
-        argon2
-            .hash_password_into(password.as_bytes(), salt.as_bytes(), &mut output)
-            .expect("Argon2 failed");
-        let answer = hex::encode(output);
-
-        send_message(&mut stream, &Message::LoginAnswer { hash: answer })?;
-
-        match read_message(&mut stream)? {
-            Message::Welcome { .. } => Ok(stream),
-            Message::ErrorMessage { text } => Err(ParaFlowError::AuthError(text)),
-            _ => Err(ParaFlowError::ProtocolError(
-                "Unexpected message during auth".into(),
-            )),
+    let config_path = home.join(".paraflow.toml");
+    if !config_path.exists() {
+        return (transfer::Config::default(), Some("no config found, using defaults".to_string()));
+    }
+    
+    match std::fs::read_to_string(&config_path) {
+        Ok(content) => {
+            match toml::from_str::<transfer::Config>(&content) {
+                Ok(cfg) => (cfg, None),
+                Err(e) => (transfer::Config::default(), Some(format!("invalid config format: {}, using defaults", e))),
+            }
         }
-    } else {
-        Err(ParaFlowError::ProtocolError("Expected Challenge".into()))
+        Err(_) => (transfer::Config::default(), Some("failed to read config, using defaults".to_string())),
     }
 }
 
-fn read_chunk(filename: &str, chunk_index: u64) -> Vec<u8> {
-    let mut file = File::open(filename).expect("File not found");
-    let chunk_size = 4 * 1024 * 1024;
-    file.seek(SeekFrom::Start(chunk_index * chunk_size))
-        .unwrap();
-    let mut buffer = Vec::new();
-    let _ = file.take(chunk_size).read_to_end(&mut buffer);
-    buffer
-}
-
 fn main() {
-    println!("\x1b[36m{}\x1b[0m", BANNER);
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::Upload {
+        Some(Commands::Upload {
             file,
             host,
             port,
             threads,
             secret,
-        } => {
+        }) => {
+            println!("\x1b[36m{}\x1b[0m", BANNER);
             let encryption_key = match load_encryption_key() {
                 Ok(key) => key,
                 Err(err) => {
@@ -192,7 +101,7 @@ fn main() {
 
             let current_upload_id;
             {
-                let mut setup_stream = match connect_and_auth(&server_addr, secret) {
+                let mut setup_stream = match transfer::connect_and_auth(&server_addr, secret) {
                     Ok(s) => s,
                     Err(e) => {
                         eprintln!("Connection Failed: {}", e);
@@ -244,7 +153,7 @@ fn main() {
 
                 handles.push(thread::spawn(move || {
                     let mut stream =
-                        connect_and_auth(&addr, &pass).expect("Worker failed to authenticate");
+                        transfer::connect_and_auth(&addr, &pass).expect("Worker failed to authenticate");
                     pb_worker.set_message("Connected");
 
                     loop {
@@ -258,7 +167,7 @@ fn main() {
 
                         loop {
                             pb_worker.set_message(format!("Uploading Chunk #{}", chunk_index));
-                            let chunk_data = read_chunk(&fname, chunk_index);
+                            let chunk_data = transfer::read_chunk(&fname, chunk_index);
                             let size_u64 = chunk_data.len() as u64;
 
                             let encrypted_chunk =
@@ -305,7 +214,7 @@ fn main() {
             pb_total.finish_with_message("Upload Complete!");
 
             let mut stream =
-                connect_and_auth(&server_addr, secret).expect("Final completion failed");
+                transfer::connect_and_auth(&server_addr, secret).expect("Final completion failed");
             send_message(
                 &mut stream,
                 &Message::Complete {
@@ -322,6 +231,13 @@ fn main() {
                     std::process::exit(1);
                 }
                 _ => eprintln!("Unexpected server response after Complete."),
+            }
+        }
+        None => {
+            let (config, initial_toast) = load_config();
+            if let Err(e) = tui::run(config, initial_toast) {
+                eprintln!("TUI Error: {}", e);
+                std::process::exit(1);
             }
         }
     }
