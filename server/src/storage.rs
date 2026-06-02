@@ -56,16 +56,23 @@ mod tests {
     use std::fs;
     use std::io::Read;
     use std::path::Path;
+    use std::sync::Mutex;
     use uuid::Uuid;
 
+    static TEST_MUTEX: Mutex<()> = Mutex::new(());
+
     fn with_temp_dir<F: FnOnce()>(f: F) {
+        let _lock = TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         let base = std::env::temp_dir().join(format!("paraflow_test_{}", Uuid::new_v4()));
         fs::create_dir_all(&base).unwrap();
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(&base).unwrap();
-        f();
-        std::env::set_current_dir(prev).unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        std::env::set_current_dir(&prev).unwrap();
         fs::remove_dir_all(&base).unwrap();
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
     }
 
     #[test]
