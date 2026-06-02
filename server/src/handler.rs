@@ -1,9 +1,13 @@
 use crate::{auth, storage};
 use sha2::{Digest, Sha256};
 use shared::{Message, ParaFlowError, encryption, load_encryption_key, read_message, send_message};
+use std::collections::HashMap;
 use std::io::Read;
 use std::net::TcpStream;
+use std::sync::{Arc, Mutex};
 use uuid::Uuid;
+
+pub type UploadRegistry = Mutex<HashMap<String, String>>;
 
 struct SessionState {
     current_salt: Option<String>,
@@ -72,6 +76,7 @@ fn handle_init_upload(
     session_id: &str,
     stream: &mut TcpStream,
     file_name: String,
+    registry: &Arc<UploadRegistry>,
 ) -> Result<(), ParaFlowError> {
     if file_name.ends_with(".sh") || file_name.ends_with(".exe") {
         send_message(
@@ -85,6 +90,10 @@ fn handle_init_upload(
 
     let upload_id = Uuid::new_v4().to_string();
     storage::create_upload_dir(session_id, &upload_id)?;
+    registry
+        .lock()
+        .unwrap()
+        .insert(upload_id.clone(), session_id.to_string());
     send_message(
         stream,
         &Message::InitAck {
@@ -95,14 +104,21 @@ fn handle_init_upload(
 }
 
 fn handle_chunk_meta(
-    session_id: &str,
     encryption_key: &[u8; 32],
     stream: &mut TcpStream,
     upload_id: String,
     chunk_index: u64,
     size: usize,
     hash: String,
+    registry: &Arc<UploadRegistry>,
 ) -> Result<(), ParaFlowError> {
+    let session_id = registry
+        .lock()
+        .unwrap()
+        .get(&upload_id)
+        .cloned()
+        .ok_or_else(|| ParaFlowError::SecurityError("Unknown upload id".into()))?;
+
     let mut encrypted_data = vec![0u8; size];
     stream.read_exact(&mut encrypted_data)?;
 
@@ -113,7 +129,7 @@ fn handle_chunk_meta(
     if server_hash == hash {
         match encryption::decrypt_chunk(&encrypted_data, encryption_key) {
             Ok(decrypted_data) => {
-                storage::save_chunk(session_id, &upload_id, chunk_index, &decrypted_data)?;
+                storage::save_chunk(&session_id, &upload_id, chunk_index, &decrypted_data)?;
                 send_message(stream, &Message::ChunkAck { chunk_index })
             }
             Err(_) => send_message(stream, &Message::ChunkNack { chunk_index }),
@@ -124,16 +140,26 @@ fn handle_chunk_meta(
 }
 
 fn handle_complete(
-    session_id: &str,
+    _stream: &mut TcpStream,
     upload_id: String,
     file_name: String,
     total_chunks: u64,
+    registry: &Arc<UploadRegistry>,
 ) -> Result<(), ParaFlowError> {
-    storage::merge_chunks(session_id, &upload_id, &file_name, total_chunks)?;
+    let session_id = registry
+        .lock()
+        .unwrap()
+        .remove(&upload_id)
+        .ok_or_else(|| ParaFlowError::SecurityError("Unknown upload id".into()))?;
+
+    storage::merge_chunks(&session_id, &upload_id, &file_name, total_chunks)?;
     Ok(())
 }
 
-pub fn handle_client(mut stream: TcpStream) -> Result<(), ParaFlowError> {
+pub fn handle_client(
+    mut stream: TcpStream,
+    registry: Arc<UploadRegistry>,
+) -> Result<(), ParaFlowError> {
     let encryption_key = load_encryption_key()?;
     let mut state = SessionState::new(encryption_key);
 
@@ -155,7 +181,7 @@ pub fn handle_client(mut stream: TcpStream) -> Result<(), ParaFlowError> {
             }
             Message::InitUpload { file_name, .. } => {
                 let session_id = require_session_id(&state)?;
-                handle_init_upload(&session_id, &mut stream, file_name)?;
+                handle_init_upload(&session_id, &mut stream, file_name, &registry)?;
             }
             Message::ChunkMeta {
                 upload_id,
@@ -163,15 +189,14 @@ pub fn handle_client(mut stream: TcpStream) -> Result<(), ParaFlowError> {
                 size,
                 hash,
             } => {
-                let session_id = require_session_id(&state)?;
                 handle_chunk_meta(
-                    &session_id,
                     &state.encryption_key,
                     &mut stream,
                     upload_id,
                     chunk_index,
                     size,
                     hash,
+                    &registry,
                 )?;
             }
             Message::Complete {
@@ -179,8 +204,7 @@ pub fn handle_client(mut stream: TcpStream) -> Result<(), ParaFlowError> {
                 file_name,
                 total_chunks,
             } => {
-                let session_id = require_session_id(&state)?;
-                handle_complete(&session_id, upload_id, file_name, total_chunks)?;
+                handle_complete(&mut stream, upload_id, file_name, total_chunks, &registry)?;
             }
             _ => {}
         }

@@ -4,7 +4,10 @@ mod storage;
 
 use clap::Parser;
 use dotenvy;
+use handler::UploadRegistry;
+use std::collections::HashMap;
 use std::net::TcpListener;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 #[derive(Parser)]
@@ -19,12 +22,15 @@ fn main() {
     let addr = format!("0.0.0.0:{}", args.port);
     let listener = TcpListener::bind(&addr).expect("Could not bind to port");
 
-    println!("🌍 Server listening on {} ...", addr);
+    let registry: Arc<UploadRegistry> = Arc::new(Mutex::new(HashMap::new()));
+
+    println!("Server listening on {} ...", addr);
 
     for stream in listener.incoming() {
         if let Ok(s) = stream {
-            thread::spawn(|| {
-                if let Err(e) = handler::handle_client(s) {
+            let reg = Arc::clone(&registry);
+            thread::spawn(move || {
+                if let Err(e) = handler::handle_client(s, reg) {
                     eprintln!("Connection error: {}", e);
                 }
             });
