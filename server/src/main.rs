@@ -16,8 +16,23 @@ struct Cli {
     port: u16,
 }
 
+fn check_required_env_vars() {
+    let mut missing = Vec::new();
+    if std::env::var("PARAFLOW_ENCRYPTION_KEY").is_err() {
+        missing.push("PARAFLOW_ENCRYPTION_KEY");
+    }
+    if std::env::var("PARAFLOW_ADMIN_PASSWORD").is_err() {
+        missing.push("PARAFLOW_ADMIN_PASSWORD");
+    }
+    if !missing.is_empty() {
+        eprintln!("Fatal: required environment variables not set: {}", missing.join(", "));
+        std::process::exit(1);
+    }
+}
+
 fn main() {
     dotenvy::dotenv().ok();
+    check_required_env_vars();
     let args = Cli::parse();
     let addr = format!("0.0.0.0:{}", args.port);
     let listener = TcpListener::bind(&addr).expect("Could not bind to port");
