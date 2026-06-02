@@ -1,23 +1,28 @@
-use sha2::{Digest, Sha256};
+use argon2::{Algorithm, Argon2, Params, Version};
+use shared::ParaFlowError;
 use uuid::Uuid;
 
-/// Generates a unique salt for the Challenge-Response handshake
 pub fn generate_salt() -> String {
     Uuid::new_v4().to_string()
 }
 
-pub fn verify_user(username: &str, salt: &str, answer: &str) -> bool {
-    if username == "admin" {
-        // Load password from environment variable
-        let actual_pass = std::env::var("PARAFLOW_ADMIN_PASSWORD")
-            .unwrap_or_else(|_| "default_fallback_change_me".to_string());
+fn compute_challenge_hash(password: &str, challenge: &str) -> Result<String, ParaFlowError> {
+    let params = Params::new(19456, 2, 1, Some(32))
+        .map_err(|e| ParaFlowError::EncryptionError(e.to_string()))?;
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut output = [0u8; 32];
+    argon2
+        .hash_password_into(password.as_bytes(), challenge.as_bytes(), &mut output)
+        .map_err(|e| ParaFlowError::EncryptionError(e.to_string()))?;
+    Ok(hex::encode(output))
+}
 
-        let combined = format!("{}{}", actual_pass, salt);
-        let mut hasher = Sha256::new();
-        hasher.update(combined.as_bytes());
-        let expected_hash = hex::encode(hasher.finalize());
-
-        return answer == expected_hash;
+pub fn verify_user(username: &str, salt: &str, answer: &str) -> Result<bool, ParaFlowError> {
+    if username != "admin" {
+        return Ok(false);
     }
-    false
+    let password = std::env::var("PARAFLOW_ADMIN_PASSWORD")
+        .map_err(|_| ParaFlowError::SecurityError("PARAFLOW_ADMIN_PASSWORD not set".into()))?;
+    let expected = compute_challenge_hash(&password, salt)?;
+    Ok(answer == expected)
 }

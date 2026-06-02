@@ -1,3 +1,4 @@
+use argon2::{Algorithm, Argon2, Params, Version};
 use clap::{Parser, Subcommand};
 use hex;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -56,10 +57,13 @@ fn connect_and_auth(address: &str, password: &str) -> Result<TcpStream, ParaFlow
     // 2. Get Challenge (Now returns Result, so we use ?)
     if let Message::LoginChallenge { salt } = read_message(&mut stream)? {
         // 3. Solve Puzzle
-        let combined = format!("{}{}", password, salt);
-        let mut hasher = Sha256::new();
-        hasher.update(combined.as_bytes());
-        let answer = hex::encode(hasher.finalize());
+        let params = Params::new(19456, 2, 1, Some(32)).expect("valid argon2 params");
+        let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+        let mut output = [0u8; 32];
+        argon2
+            .hash_password_into(password.as_bytes(), salt.as_bytes(), &mut output)
+            .expect("Argon2 failed");
+        let answer = hex::encode(output);
 
         // 4. Send Answer
         send_message(&mut stream, &Message::LoginAnswer { hash: answer })?;

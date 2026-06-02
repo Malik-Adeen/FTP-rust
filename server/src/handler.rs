@@ -63,7 +63,7 @@ fn handle_login_answer(
         .take()
         .ok_or_else(|| ParaFlowError::ProtocolError("Missing login challenge".into()))?;
 
-    if auth::verify_user("admin", &salt, &hash) {
+    if auth::verify_user("admin", &salt, &hash)? {
         println!("Auth Success!");
         state.is_authenticated = true;
         let session_id = Uuid::new_v4().to_string();
